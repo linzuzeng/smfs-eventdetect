@@ -23,14 +23,14 @@ class Metric:
         self.truenegative = 0
         self.falsepositve = 0
         self.falsenegative = 0
-
+        self.sqrerr = 0.0
     def __str__(self):
         F1score, total_tests, accuracy, precision, recall = self.get_score()
 
-        infostring = 'Acc: %.3f%% (%d: TP %d TN %d FP %d FN %d), P: %.3f%%, R: %.3f%%, F1:%.3f%%' % (
+        infostring = 'Acc: %.3f%% (%d: TP %d TN %d FP %d FN %d), P: %.3f%%, R: %.3f%%, F1:%.3f%%, MSE:%.3f, RMS:%.3f' % (
             100.*accuracy, total_tests,
             self.truepositve, self.truenegative, self.falsepositve, self.falsenegative,
-            100.*precision, 100.*recall, 100.*F1score)
+            100.*precision, 100.*recall, 100.*F1score, self.sqrerr/self.truepositve, math.sqrt(self.sqrerr/self.truepositve))
         return infostring
 
     def get_score(self, F1_only=False):
@@ -48,74 +48,85 @@ class Metric:
         else:
             return F1score,  total_tests, accuracy, precision, recall
 
-    def update(self, regressor, target_regress):
+    def update(self, enable, target_regress,predict_regressor):
+        pred_positive = (enable <= 0.5)
+        pred_negative = (enable > 0.5)
+        acutual_postive = (abs(target_regress - 0.5) <= 0.5/2)
+        acutual_negative = (abs(target_regress - 0.5) > 0.5/2)
+        self.sqrerr += torch.sum(
+           ((target_regress-predict_regressor)**2 ) * (pred_positive & acutual_postive).type(torch.uint8))
         self.truepositve += torch.sum(
-            (abs(regressor-target_regress) < 0.5/2) & (abs(target_regress - 0.5) <= 0.5/2))
-        self.truenegative += torch.sum(
-            (abs(regressor-target_regress) < 0.5/2) & (abs(target_regress - 0.5) > 0.5/2))
+            pred_positive & acutual_postive)
         self.falsepositve += torch.sum(
-            (abs(regressor-target_regress) >= 0.5/2) & (abs(target_regress - 0.5) > 0.5/2))
+            pred_positive & acutual_negative)
         self.falsenegative += torch.sum(
-            (abs(regressor-target_regress) >= 0.5/2) & (abs(target_regress - 0.5) <= 0.5/2))
+            pred_negative & acutual_postive)
+        self.truenegative += torch.sum(
+            pred_negative & acutual_negative)
 
 
 def main():
     matplotlib.use('Agg')
-
     parser = argparse.ArgumentParser(
-        description='Locate events from SMFS datastream')
-
-    parser.add_argument('--train',  default=1, type=int,
-                        help='train flag')
-    parser.add_argument('--minibatches_per_step',
-                        default=10, type=int, help='minibatches_per_step')
-    parser.add_argument('--minibatch_size',
-                        default=300, type=int, help='minibatch_size')
-    parser.add_argument('--epoch',
-                        default=31, type=int, help='epoch')
-    parser.add_argument('--learning_rate',
-                        default=0.001, type=float, help='learning_rate')
-    parser.add_argument('--data_split',
-                        default="0,1.0", type=str, help='data_split')
-    parser.add_argument('--data_kept',
-                        default="0,0", type=str, help='data_split')
-    parser.add_argument('--noiselevel',
-                        default="0,0", type=str, help='noiselevel')
+        description='SMFS Event Detect')
     parser.add_argument('--datafolder',
-                        default="./output", type=str, help='datafolder for .np files')
+                        default="./input", type=str, help='folder for data (.np) files')
     parser.add_argument('--modelfile',
-                        default="./report/model-latest.pt", type=str, help='modelfile for a .pt file')
+                        default="./report/model-latest.pt", type=str, help='folder for model (.pt) files')
     parser.add_argument('--cuda', metavar='1 or 0', default=0 if torch.cuda.is_available() else 0, type=int,
-                        help='cuda')
+                        help='use cuda')
+    parser.add_argument('--train',  default=1, type=int,
+                        help='set 1 to train the model, set 0 to test the trained model')
+    parser.add_argument('--predict_size',
+                        default=300, type=int, help='predict_size for predicting')
+    parser.add_argument('--minibatches_per_step',
+                        default=10, type=int, help='minibatches_per_step for training')
+    parser.add_argument('--minibatch_size',
+                        default=300, type=int, help='minibatch_size for training')
+    parser.add_argument('--epoch',
+                        default=30, type=int, help='epochs for training')
+    parser.add_argument('--learning_rate',
+                        default=0.001, type=float, help='learning_rate for training')
+    parser.add_argument('--data_split',
+                        default="0,1.0", type=str, help='data_split for truncating dataset')
+    parser.add_argument('--data_kept',
+                        default="0,0", type=str, help='data_kept for truncating dataset')
+    parser.add_argument('--source_scale',
+                        default="400, 50", type=str, help='source_scale in nm and pN for transforming input signals in the dataset')
+    parser.add_argument('--source_bias',
+                        default="-1.6, -1.5", type=str, help='source_bias after applying source_scale for transforming input signals in the dataset')
     parser.add_argument('--downsampling',  default=1, type=int,
-                        help='downsampling')
-    parser.add_argument('--pdfheader',  default="test", type=str,
-                        help='pdfheader')
-    parser.add_argument('--test_size',
-                        default=300, type=int, help='test_size')
+                        help='perform downsampling using averaging filter on input data')
+    parser.add_argument('--noiselevel',
+                        default="0,0", type=str, help='add extra Gaussian noise (level in nm and pN) into input dataset')
+    parser.add_argument('--report',  default="./report/", type=str,
+                        help='folder for saving repots')
+    parser.add_argument('--report_note',  default="train", type=str,
+                        help='add prefix to each report file')
     args = parser.parse_args()
 
     device = torch.device('cuda' if args.cuda else 'cpu')
     print(device)
 
     data_split = [float(item) for item in args.data_split.split(',')]
+    source_scale = [float(item) for item in args.source_scale.split(',')]
+    source_bias = [float(item) for item in args.source_bias.split(',')]
     data_kept = [int(item) for item in args.data_kept.split(',')]
     if args.cuda == 0:
         print("WARNING: run in debugging mode")
         args.epoch = 0
 
-    np.random.seed(0)
-    torch.manual_seed(0)
     if not args.train:
-        print("WARNING: Running in eval mode, using no noise!")
-        noiselevel = [0, 0]
-    else:
-        args.pdfheader = "train"
-        noiselevel = [float(item) for item in args.noiselevel.split(',')]
-        print("using noise level "+str(noiselevel))
+        args.report_note = "test"
+        args.epoch = 1
+    args.report = args.report
+    noiselevel = [float(item) for item in args.noiselevel.split(',')]
+    print("using noise level "+str(noiselevel))
 
     spLoader = SpectrumLoader(
-        datafolder=args.datafolder, recpetive_field=model.receptive_field, filename_suffix="", AWGN=noiselevel, downsampling=args.downsampling, data_split=data_split, data_kept=data_kept)
+        datafolder=args.datafolder, recpetive_field=model.receptive_field, filename_suffix="",
+        AWGN=noiselevel, downsampling=args.downsampling, source_scale=source_scale,
+        source_bias=source_bias, data_split=data_split, data_kept=data_kept)
     print("DataSet Size: %d" % spLoader.size)
     total_steps_per_epoch = (
         spLoader.size+args.minibatches_per_step) // args.minibatches_per_step
@@ -157,13 +168,13 @@ def main():
                 predict_invreg, predict_regressor = seq_predictor(
                     source_minibatch)
 
-                # lossbce = bcecriterion(predict_binary, target_binary)
                 lossmse = msecriterion(
                     predict_regressor, target_regress)*0.5
-                metric_epoch.update(predict_regressor, target_regress)
                 lossmse_inv = msecriterion(
                     predict_invreg, target_invreg)*0.5
-                # metric_epoch.update(predict_invreg, target_invreg)
+                enable = (abs(predict_regressor-0.5) + abs(predict_invreg-0.5))
+                with torch.no_grad():
+                    metric_epoch.update(enable, target_regress,predict_regressor)
                 loss = lossmse+lossmse_inv
                 total_loss += float(loss.item())
                 total_mse_loss += float(lossmse.item())
@@ -173,10 +184,10 @@ def main():
             if args.train:
                 optimizer.step()
 
-                report_man.progress_bar(step, total_steps_per_epoch, args.pdfheader +
+                report_man.progress_bar(step, total_steps_per_epoch, args.report_note +
                                         " Epoch: %d | Loss: %.6f/%.6f | " % (epoch, total_loss, total_mse_loss) + str(metric_epoch))
 
-        print("FINAL: "+args.pdfheader+" | Epoch: %d | total metric " %
+        print("FINAL: "+args.report_note+" | Epoch: %d | total metric " %
               (epoch) + str(metric_epoch))
         if metric_epoch.get_score(F1_only=True) >= best_metric_epoch.get_score(F1_only=True):
             best_metric_epoch = metric_epoch
@@ -189,9 +200,9 @@ def main():
                 if epoch % 10 == 0:
                     print("Checkpoint ... | Epoch: %d" % (epoch))
                     torch.save(seq_predictor.state_dict(
-                    ), report_man.get_report_folder()+'model%d.pt' % epoch)
+                    ), report_man.get_report_folder(args.report)+'model%d.pt' % epoch)
 
-    with open(report_man.get_report_folder()+args.pdfheader+".log", "a") as logfile:
+    with open(report_man.get_report_folder(args.report)+args.report_note+".log", "a") as logfile:
         import sys
         logfile.write(' '.join(sys.argv)+"\n")
         logfile.write('at {}: {}\n'.format(
@@ -200,21 +211,22 @@ def main():
     if args.train:
         torch.save(seq_predictor.state_dict(), args.modelfile)
     else:
-        test_on_single(args, spLoader, device,
-                       seq_predictor, noiselevel, args.pdfheader)
+        predict_on_single(args, spLoader, device,
+                          seq_predictor, noiselevel)
 
-    with open(report_man.get_report_folder()+args.pdfheader+".log", "r") as logfile:
+    with open(report_man.get_report_folder(args.report)+args.report_note+".log", "r") as logfile:
         print(logfile.read())
 
 
-def test_on_single(args, spLoader, device, seq_predictor, noiselevel, pdfheader):
+def predict_on_single(args, spLoader, device, seq_predictor, noiselevel):
+    spLoader.reset(randomize=False)
     try:
-        with open(report_man.get_report_folder()+args.pdfheader+".json", "r") as jsonfile:
+        with open(report_man.get_report_folder(args.report)+args.report_note+".json", "r") as jsonfile:
             summerize_results = json.load(jsonfile)
     except Exception as e:
         print("ERROR: fail to load result json "+str(e))
         summerize_results = {}
-    for print_id in range(min(args.test_size, spLoader.size)):
+    for print_id in range(min(args.predict_size, spLoader.size)):
         source, _, _, rawinfo = spLoader.get_samples(
             device=device)
         (source_raw, target_raw, target_events, filename) = rawinfo
@@ -235,10 +247,8 @@ def test_on_single(args, spLoader, device, seq_predictor, noiselevel, pdfheader)
         predict_regressor = predict_regressor.cpu().numpy()
         predict_invreg = predict_invreg.cpu().numpy()
 
-        result_filename = report_man.get_report_folder() + pdfheader+"-" + \
+        result_filename = report_man.get_report_folder(args.report) + args.report_note+"-" + \
             os.path.basename(filename)
-        np.save(result_filename, np.vstack(
-            (predict_regressor, predict_invreg)))
 
         use_differential = True
         predict_events = []
@@ -261,19 +271,21 @@ def test_on_single(args, spLoader, device, seq_predictor, noiselevel, pdfheader)
                     predict_events.append(
                         (reg_i+model.receptive_field//2, math.exp(-1.0*abs(predict_regressor[reg_i]))))
         else:
-            predict_regressor = predict_regressor * \
-                (predict_regressor > 0.01) - \
-                predict_invreg * (predict_regressor > 0.01)
+            enable = (abs(predict_regressor-0.5) + abs(predict_invreg-0.5))
+            predict_regressor_ret = (
+                predict_regressor - predict_invreg) * (enable < 0.5/2)
 
             supression_size = 5
-            for reg_i in range(supression_size, predict_regressor.shape[0]-supression_size):
+            for reg_i in range(supression_size, predict_regressor_ret.shape[0]-supression_size):
+                if enable[reg_i] <= 0:
+                    continue
                 left_avg = np.mean(
-                    predict_regressor[reg_i-supression_size:reg_i])
+                    predict_regressor_ret[reg_i-supression_size:reg_i])
                 right_avg = np.mean(
-                    predict_regressor[reg_i+1:reg_i+supression_size])
+                    predict_regressor_ret[reg_i+1:reg_i+supression_size])
                 if left_avg < 0 and right_avg > 0:
                     predict_events.append(
-                        (reg_i+model.receptive_field//2, math.exp(-1.0*abs(predict_regressor[reg_i]))))
+                        (reg_i+model.receptive_field//2, math.exp(-1.0*abs(predict_regressor_ret[reg_i]))))
 
         summerize_results[filename] = (target_events, predict_events)
         if predict_events:
@@ -284,27 +296,26 @@ def test_on_single(args, spLoader, device, seq_predictor, noiselevel, pdfheader)
             target_to_detection_distances = spLoader.get_distances(
                 predict_events, target_events)
 
-            print(pdfheader+" {} | Print: {} d2t: {}  t2d: {}" .format(print_id, filename,
+            print(args.report_note+" {} | Print: {} d2t: {}  t2d: {}" .format(print_id, filename,
                                                                        np.mean(detection_to_target_distances), np.mean(target_to_detection_distances)))
-            if print_id < 30:
-                draw_pdf(result_filename, ' AWGN '+str(noiselevel),
-                         predict_regressor, predict_events, target_raw, source_raw)
-            else:
-                print("Ignore PDF printing.")
         else:
             print(
-                pdfheader+" {} | Print: {}, nothing detected." .format(print_id, filename))
-    with open(report_man.get_report_folder()+args.pdfheader+".json", "w") as jsonfile:
+                args.report_note+" {} | Print: {}, nothing detected." .format(print_id, filename))
+        np.savez_compressed(result_filename,
+                            predict_regressor=predict_regressor, predict_invreg=predict_invreg,  predict_events=np.array(predict_events), target_events=np.array(target_events), target_raw=target_raw, source_raw=source_raw)
+        draw_pdf(result_filename, ' AWGN '+str(noiselevel),
+                 predict_regressor, predict_invreg, predict_events, target_raw, source_raw)
+    with open(report_man.get_report_folder(args.report)+args.report_note+".json", "w") as jsonfile:
         json.dump(summerize_results, jsonfile, indent=4)
 
 
-def draw_pdf(pdfheader, noiselevel, predict_regressor, predict_events, target_raw, source_raw):
+def draw_pdf(result_filename, noiselevel, predict_regressor, predict_invreg, predict_events, target_raw, source_raw):
     def draw(data, color, offset=0, linewidth=2.0):
         plt.plot(np.arange(data.shape[0]) +
                  offset, data, color, linewidth=linewidth)
     # plotting and display
     plt.figure(figsize=(30, 10))
-    plt.xlabel(pdfheader+noiselevel, fontsize=20)
+    plt.xlabel(result_filename+noiselevel, fontsize=20)
     plt.ylabel('y', fontsize=20)
     plt.xticks(fontsize=20)
     plt.yticks(fontsize=20)
@@ -315,7 +326,8 @@ def draw_pdf(pdfheader, noiselevel, predict_regressor, predict_events, target_ra
     draw(source_raw[1], 'b')
     draw(target_raw, 'g')
     draw(predict_regressor, 'black', offset=model.receptive_field//2, linewidth=1.0)
-    plt.savefig(pdfheader + ".pdf")
+    draw(-predict_invreg, 'black', offset=model.receptive_field//2, linewidth=1.0)
+    plt.savefig(result_filename + ".pdf")
     plt.close()
 
 
